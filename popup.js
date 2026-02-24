@@ -126,20 +126,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     const text = document.getElementById('export-area').value;
     if (!text) return setStatus('NOTHING TO SAVE', 'error');
     const ext = activeFormat === 'json' ? '.json' : '.txt';
+    const mime = activeFormat === 'json' ? 'application/json' : 'text/plain';
     const domain = url.hostname.replace(/\./g, '_');
-    const blob = new Blob([text], { type: 'text/plain' });
+    const blob = new Blob([text], { type: mime });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `cookies_${domain}${ext}`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    }, 200);
     setStatus('FILE SAVED', 'success');
   };
 
   // LOAD FROM FILE
   const fileInput = document.getElementById('file-input');
-  document.getElementById('btn-load-file').onclick = () => fileInput.click();
-  fileInput.onchange = (e) => {
+  document.getElementById('btn-load-file').onclick = () => {
+    fileInput.value = '';
+    fileInput.click();
+  };
+  fileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
@@ -150,7 +159,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     reader.onerror = () => setStatus('READ FAILED', 'error');
     reader.readAsText(file);
     fileInput.value = '';
-  };
+  });
 
   // FIX: tidak double-call loadCookies + setStatus; clear manual lalu set status sendiri
   document.getElementById('btn-clear').onclick = async () => {
