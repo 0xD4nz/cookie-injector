@@ -84,11 +84,13 @@
         <div class="import-toolbar">
           <button id="btn-paste" class="toolbar-link">Paste</button>
           <span class="toolbar-sep">·</span>
-          <button id="btn-load-file" class="toolbar-link">Load File</button>
+          <span class="toolbar-link file-load-wrap">
+            Load File
+            <input type="file" id="file-input" accept=".json,.txt,.cookies">
+          </span>
           <span class="toolbar-sep">·</span>
           <button id="btn-clear-import" class="toolbar-link danger-link">Clear</button>
         </div>
-        <input type="file" id="file-input" accept=".json,.txt,.cookies" style="display:none;">
         <textarea id="import-area" placeholder="Paste JSON, Netscape, or Header String..."></textarea>
         <button id="btn-inject" class="btn success full-width rounded-btn btn-sm">
           <svg class="icon-small" viewBox="0 0 24 24">

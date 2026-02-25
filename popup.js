@@ -1,7 +1,56 @@
+// Android popup → full tab redirect (popup can't open file picker on Android)
+if (/Android/i.test(navigator.userAgent) && !location.search.includes('mode=tab')) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tabId = tabs[0]?.id || '';
+    chrome.tabs.create({ url: chrome.runtime.getURL(`popup.html?mode=tab&tabId=${tabId}`) });
+    window.close();
+  });
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const url = new URL(tab.url);
+  // Find the target tab
+  const params = new URLSearchParams(location.search);
+  const savedTabId = params.get('tabId');
+  let tab;
+
+  if (savedTabId) {
+    // Opened as full tab (Android) — use saved tab ID
+    try {
+      tab = await chrome.tabs.get(parseInt(savedTabId));
+    } catch (_) { }
+  }
+
+  if (!tab) {
+    // Normal popup mode — use active tab
+    const queryTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tab = queryTabs[0];
+  }
+
+  let url = new URL(tab.url);
   document.getElementById('domain-label').innerText = url.hostname;
+
+  // --- REALTIME SITE DETECTION (polling, works on all browsers) ---
+  let currentHostname = url.hostname;
+
+  async function checkTabUrl() {
+    try {
+      const freshTab = await chrome.tabs.get(tab.id);
+      if (freshTab.url && freshTab.url.startsWith('http')) {
+        const parsed = new URL(freshTab.url);
+        if (parsed.hostname !== currentHostname) {
+          currentHostname = parsed.hostname;
+          tab = freshTab;
+          url = parsed;
+          document.getElementById('domain-label').innerText = currentHostname;
+          cachedCookies = [];
+          firstLoad = true;
+          loadCookies();
+        }
+      }
+    } catch (_) { }
+  }
+
+  setInterval(checkTabUrl, 2000);
 
   // --- UI NAVIGATION ---
   const tabs = { cookies: document.getElementById('tab-cookies'), spoof: document.getElementById('tab-spoof') };
@@ -121,33 +170,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   };
 
-  // SAVE TO FILE
-  document.getElementById('btn-save-file').onclick = () => {
+  // SAVE TO FILE — use chrome.downloads API, fallback to anchor tag, then close popup
+  document.getElementById('btn-save-file').onclick = async () => {
     const text = document.getElementById('export-area').value;
     if (!text) return setStatus('NOTHING TO SAVE', 'error');
     const ext = activeFormat === 'json' ? '.json' : '.txt';
     const mime = activeFormat === 'json' ? 'application/json' : 'text/plain';
     const domain = url.hostname.replace(/\./g, '_');
+    const filename = `cookies_${domain}${ext}`;
     const blob = new Blob([text], { type: mime });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `cookies_${domain}${ext}`;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
+    const dataUrl = await new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.readAsDataURL(blob);
+    });
+
+    let saved = false;
+    try {
+      if (chrome.downloads && chrome.downloads.download) {
+        await chrome.downloads.download({ url: dataUrl, filename });
+        saved = true;
+      }
+    } catch (_) { }
+
+    if (!saved) {
+      // Fallback: anchor tag download (works on Android & desktop)
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(a.href);
-    }, 200);
+    }
+
     setStatus('FILE SAVED', 'success');
   };
 
-  // LOAD FROM FILE
+  // LOAD FROM FILE — input overlays "Load File" text, user taps it directly
   const fileInput = document.getElementById('file-input');
-  document.getElementById('btn-load-file').onclick = () => {
-    fileInput.value = '';
-    fileInput.click();
-  };
   fileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -171,17 +232,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     cachedCookies = [];
     renderExport();
     setStatus('CLEARED', 'success');
+    // Reload target tab after clearing
+    setTimeout(async () => {
+      try { await chrome.tabs.reload(tab.id); } catch (_) { }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => location.reload()
+        });
+      } catch (_) { }
+    }, 500);
   };
 
-  // PASTE from clipboard into import textarea
+  // PASTE from clipboard — reliable method for Chrome extension popups
   document.getElementById('btn-paste').onclick = async () => {
+    const importArea = document.getElementById('import-area');
+    let text = '';
+
+    // Method 1: Hidden textarea + execCommand('paste') — most reliable in extensions
     try {
-      const text = await navigator.clipboard.readText();
-      if (!text) return setStatus('CLIPBOARD EMPTY', 'error');
-      document.getElementById('import-area').value = text;
+      const tmp = document.createElement('textarea');
+      tmp.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;';
+      document.body.appendChild(tmp);
+      tmp.focus();
+      document.execCommand('paste');
+      text = tmp.value;
+      document.body.removeChild(tmp);
+    } catch (_) { }
+
+    // Method 2: Clipboard API fallback
+    if (!text) {
+      try {
+        text = await navigator.clipboard.readText();
+      } catch (_) { }
+    }
+
+    if (text) {
+      importArea.value = text;
       setStatus('PASTED!', 'success');
-    } catch (e) {
-      setStatus('PASTE FAILED', 'error');
+    } else {
+      setStatus('CLIPBOARD EMPTY', 'error');
     }
   };
 
@@ -258,10 +348,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     setStatus(`INJECTED ${count}`, 'success');
-    // Double reload: satu untuk PC, satu untuk Android browser (Lemur/Kiwi)
-    setTimeout(() => {
-      chrome.tabs.update(tab.id, { url: tab.url });
-      chrome.tabs.reload(tab.id);
+    // Reload target tab — multiple methods for Android compatibility
+    setTimeout(async () => {
+      try { await chrome.tabs.reload(tab.id); } catch (_) { }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => location.reload()
+        });
+      } catch (_) { }
     }, 500);
   };
 
@@ -328,7 +423,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       setStatus('SPOOF ACTIVE', 'success');
     }
-    chrome.tabs.reload(tab.id);
+    // Reload tab — use multiple methods for Android compatibility
+    try {
+      await chrome.tabs.reload(tab.id);
+    } catch (_) { }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => location.reload()
+      });
+    } catch (_) { }
   }
 
   document.querySelectorAll('.ua-btn').forEach(btn => {

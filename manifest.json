@@ -1,18 +1,25 @@
 {
   "manifest_version": 3,
   "name": "Cookie Injector",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Professional Cookie Manager & User-Agent Spoofer",
   "permissions": [
     "cookies",
     "activeTab",
+    "tabs",
     "scripting",
     "declarativeNetRequest",
-    "storage"
+    "storage",
+    "downloads",
+    "clipboardRead",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "CIP Tools"
