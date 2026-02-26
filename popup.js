@@ -1,9 +1,10 @@
-// Android popup → full tab redirect (popup can't open file picker on Android)
+// Android: redirect popup → full tab (popup can't open file picker on Android)
 if (/Android/i.test(navigator.userAgent) && !location.search.includes('mode=tab')) {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    const tabId = tabs[0]?.id || '';
-    chrome.tabs.create({ url: chrome.runtime.getURL(`popup.html?mode=tab&tabId=${tabId}`) });
-    window.close();
+    if (tabs[0]?.id) {
+      chrome.tabs.create({ url: chrome.runtime.getURL(`popup.html?mode=tab&tabId=${tabs[0].id}`) });
+      window.close();
+    }
   });
 }
 
@@ -29,28 +30,33 @@ document.addEventListener('DOMContentLoaded', async () => {
   let url = new URL(tab.url);
   document.getElementById('domain-label').innerText = url.hostname;
 
-  // --- REALTIME SITE DETECTION (polling, works on all browsers) ---
+  // --- REALTIME SITE DETECTION + COOKIE REFRESH (polling, universal) ---
   let currentHostname = url.hostname;
 
-  async function checkTabUrl() {
+  async function pollTargetTab() {
     try {
       const freshTab = await chrome.tabs.get(tab.id);
       if (freshTab.url && freshTab.url.startsWith('http')) {
         const parsed = new URL(freshTab.url);
         if (parsed.hostname !== currentHostname) {
+          // Site changed — update domain and reload cookies
           currentHostname = parsed.hostname;
           tab = freshTab;
           url = parsed;
           document.getElementById('domain-label').innerText = currentHostname;
           cachedCookies = [];
           firstLoad = true;
-          loadCookies();
         }
       }
     } catch (_) { }
+    // Refresh cookies if on export view
+    if (document.getElementById('panel-cookies').classList.contains('active') &&
+      document.getElementById('view-export').style.display !== 'none') {
+      loadCookies();
+    }
   }
 
-  setInterval(checkTabUrl, 2000);
+  setInterval(pollTargetTab, 2000);
 
   // --- UI NAVIGATION ---
   const tabs = { cookies: document.getElementById('tab-cookies'), spoof: document.getElementById('tab-spoof') };
@@ -107,12 +113,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   let cachedCookies = [];
   let firstLoad = true;
 
+  // Known tracking/analytics cookie prefixes to filter out
+  const TRACKING_PREFIXES = [
+    '_ga', '_gid', '_gcl', '_gat', '__utm',  // Google Analytics/Ads
+    '_fbp', '_fbc', '_fbq',                   // Facebook
+    '_tt_', '_ttp',                            // TikTok
+    '_pin_',                                   // Pinterest
+    'twk_', 'TawkConnectionTime',              // Tawk.to chat
+    '__cf_bm', 'cf_clearance',                 // Cloudflare
+    '_hjid', '_hjSession',                     // Hotjar
+    'intercom-',                               // Intercom
+    '_clck', '_clsk', 'CLID',                  // Microsoft Clarity
+  ];
+
+  function isTrackingCookie(name) {
+    return TRACKING_PREFIXES.some(prefix => name.startsWith(prefix));
+  }
+
+  function getFilteredCookies() {
+    return cachedCookies.filter(c => !isTrackingCookie(c.name));
+  }
+
   async function loadCookies() {
     try {
       cachedCookies = await chrome.cookies.getAll({ url: tab.url });
       renderExport();
       if (firstLoad) {
-        setStatus(`LOADED ${cachedCookies.length} COOKIES`, 'success');
+        const filtered = getFilteredCookies();
+        setStatus(`LOADED ${filtered.length}/${cachedCookies.length} COOKIES`, 'success');
         firstLoad = false;
       }
     } catch (e) {
@@ -124,12 +152,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function renderExport() {
     const txt = document.getElementById('export-area');
+    const cookies = getFilteredCookies();
     if (activeFormat === 'json') {
-      txt.value = JSON.stringify(cachedCookies, null, 2);
+      txt.value = JSON.stringify(cookies, null, 2);
     } else if (activeFormat === 'header') {
-      txt.value = cachedCookies.map(c => `${c.name}=${c.value}`).join('; ');
+      txt.value = cookies.map(c => `${c.name}=${c.value}`).join('; ');
     } else if (activeFormat === 'netscape') {
-      txt.value = cachedCookies.map(c => {
+      txt.value = cookies.map(c => {
         const domain = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
         const flag = c.domain.startsWith('.') ? 'TRUE' : 'FALSE';
         return `${domain}\t${flag}\t${c.path}\t${c.secure ? 'TRUE' : 'FALSE'}\t${Math.round(c.expirationDate || 0)}\t${c.name}\t${c.value}`;
@@ -149,21 +178,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   });
 
-  // Auto-refresh cookies every 2 seconds
-  setInterval(() => {
-    if (document.getElementById('panel-cookies').classList.contains('active') &&
-      document.getElementById('view-export').style.display !== 'none') {
-      loadCookies();
-    }
-  }, 2000);
+  // Cookie refresh is handled by pollTargetTab() above
 
-  // FIX: navigator.clipboard menggantikan execCommand yang deprecated
+  // Copy to clipboard (with fallback)
   document.getElementById('btn-copy').onclick = async () => {
     const text = document.getElementById('export-area').value;
     try {
       await navigator.clipboard.writeText(text);
       setStatus('COPIED!', 'success');
-    } catch (e) {
+    } catch (_) {
       document.getElementById('export-area').select();
       document.execCommand('copy');
       setStatus('COPIED!', 'success');
@@ -222,7 +245,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     fileInput.value = '';
   });
 
-  // FIX: tidak double-call loadCookies + setStatus; clear manual lalu set status sendiri
+  // Clear all cookies for current domain
   document.getElementById('btn-clear').onclick = async () => {
     const cookies = await chrome.cookies.getAll({ url: tab.url });
     for (const c of cookies) {
@@ -289,8 +312,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (raw.startsWith('[') || raw.startsWith('{')) {
       try {
-        cookies = JSON.parse(raw);
-        if (!Array.isArray(cookies)) cookies = [cookies];
+        let parsed = JSON.parse(raw);
+        // Support {url, cookies: [...]} wrapper format
+        if (!Array.isArray(parsed) && parsed.cookies && Array.isArray(parsed.cookies)) {
+          cookies = parsed.cookies;
+        } else if (Array.isArray(parsed)) {
+          cookies = parsed;
+        } else {
+          cookies = [parsed];
+        }
       } catch (e) {
         return setStatus('BAD JSON', 'error');
       }
@@ -310,7 +340,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       });
     } else {
-      // FIX: split pada '=' pertama saja, agar value yang mengandung '=' tidak terpotong
+      // Header string: split on first '=' to preserve values containing '='
       raw.split(';').forEach(p => {
         const idx = p.indexOf('=');
         if (idx > 0) {
@@ -361,7 +391,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
 
   // --- SPOOFING LOGIC ---
-  // FIX: update versi Chrome ke 124
   const UAS = {
     win: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     mac: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -372,7 +401,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const currentLabel = document.getElementById('current-ua');
 
-  // FIX: restore active button highlight dari storage saat popup dibuka
+  // Restore active UA state from storage
   chrome.storage.local.get(['activeUA', 'activeUAKey'], (res) => {
     if (res.activeUA) {
       currentLabel.innerText = res.activeUA.length > 30
@@ -405,7 +434,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               { header: 'User-Agent', operation: 'set', value: uaString },
               { header: 'sec-ch-ua', operation: 'remove' },
               { header: 'sec-ch-ua-platform', operation: 'remove' },
-              { header: 'sec-ch-ua-mobile', operation: 'remove' }  // FIX: tambah header ini
+              { header: 'sec-ch-ua-mobile', operation: 'remove' }
             ]
           },
           condition: {
@@ -450,7 +479,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('btn-reset-ua').onclick = () => applyUA(null);
 
-  // CUSTOM UA — FIX: support Enter key
+  // Custom UA input (supports Enter key)
   const customInput = document.getElementById('custom-ua-input');
 
   function applyCustomUA() {
